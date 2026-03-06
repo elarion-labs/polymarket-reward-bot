@@ -1,0 +1,37 @@
+{
+  "_comment": "Manual market override file for the Polymarket Reward Bot.",
+  "_comment_2": "This file is OPTIONAL. The dashboard normally provides the market reference dynamically.",
+  "_comment_3": "If the dashboard has no manual market configured, the bot will fall back to this file.",
+  "_comment_4": "Only ONE reference field is required. Prefer using the 'url' field because it is the most stable and user-friendly.",
+
+  "_comment_supported_fields": "Supported reference types (use only one): url | slug | condition_id | market_id",
+
+  "url": "https://polymarket.com/event/example-market",
+
+
+  "_future_options": "Below are alternative reference formats that can be used instead of URL.",
+  "_future_note": "These fields are ignored unless the code is modified to use them directly.",
+
+  "slug": "",
+  "condition_id": "",
+  "market_id": "",
+
+
+  "_comment_optional_metadata": "Optional informational fields. These are NOT required by the bot and are ignored by the resolver.",
+  "_comment_optional_metadata_2": "They can be useful for documentation or debugging.",
+
+  "question": "",
+  "notes": "Optional description of why this market is manually selected.",
+
+
+  "_example_advanced": "Older versions of the bot used a fully specified market structure. That is no longer required because the PolyClient can resolve the market dynamically from the reference above.",
+
+  "legacy_market_structure_example": {
+    "yes_token_id": "",
+    "no_token_id": "",
+    "midpoint": 0.50,
+    "min_incentive_size": 0,
+    "max_incentive_spread": 0,
+    "reward_epoch_daily_budget": 0
+  }
+}
