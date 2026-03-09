@@ -90,7 +90,7 @@ class RewardBot:
         # IMPORTANT:
         # Bot must start idle and only begin selection/execution after
         # an explicit START command from the dashboard.
-        self._risk.state = BotState.PAUSED
+        self._risk.set_paused()
 
         self._running = True
         self._fills: list[Fill] = []
@@ -105,6 +105,9 @@ class RewardBot:
         # Wallet status cache
         self._available_usdc: Optional[float] = None
         self._available_usdc_last_refresh: float = 0.0
+
+        # Cooperative cancellation for blocking market selection work
+        self._selection_cancel = threading.Event()
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -158,7 +161,7 @@ class RewardBot:
 
                 logger.warning("No suitable market found; retrying in 60s")
                 await self._update_dashboard(self._current_market)
-                await asyncio.sleep(60)
+                await self._sleep_with_command_checks(60.0)
                 return
 
             if self._risk.state != BotState.SELECTING:
@@ -176,7 +179,7 @@ class RewardBot:
                         market.daily_reward_est, self.cfg.min_daily_reward_usd,
                     )
                     await self._update_dashboard(self._current_market)
-                    await asyncio.sleep(60)
+                    await self._sleep_with_command_checks(60.0)
                     return
 
             logger.info(
@@ -245,7 +248,7 @@ class RewardBot:
             self._risk.update_quote_mid(mid)
 
             await self._update_dashboard(market)
-            await asyncio.sleep(self.cfg.poll_fallback_seconds)
+            await self._sleep_with_command_checks(float(self.cfg.poll_fallback_seconds))
 
         elif state == BotState.COOLDOWN:
             if self._risk.check_cooldown_expired():
@@ -263,7 +266,7 @@ class RewardBot:
                 self._risk._cooldown_until - time.monotonic(),
             )
             await self._update_dashboard(market)
-            await asyncio.sleep(10)
+            await self._sleep_with_command_checks(10.0)
 
         elif state == BotState.UNHEDGED:
             if self._risk.check_unhedged_timeout():
@@ -288,13 +291,13 @@ class RewardBot:
             await self._update_dashboard(market)
 
             if not placed:
-                await asyncio.sleep(2)
+                await self._sleep_with_command_checks(2.0)
             else:
-                await asyncio.sleep(1)
+                await self._sleep_with_command_checks(1.0)
 
         elif state == BotState.PAUSED:
             await self._update_dashboard(self._current_market)
-            await asyncio.sleep(2)
+            await self._sleep_with_command_checks(2.0)
 
     # ------------------------------------------------------------------
     # Dashboard controls
@@ -331,12 +334,18 @@ class RewardBot:
 
         if cmd == "START":
             logger.info("Dashboard START command received")
+
+            # reset cancellation + selector timer
+            self._selection_cancel.clear()
+            self._selector._last_run = 0
+
             self._risk.set_selecting()
             await self._update_dashboard(self._current_market)
             return
 
         if cmd == "PAUSE":
             logger.info("Dashboard PAUSE command received")
+            self._selection_cancel.set()
             market = self._current_market
             if market:
                 try:
@@ -344,12 +353,13 @@ class RewardBot:
                     self._open_orders = []
                 except Exception as exc:
                     logger.warning("PAUSE cancel_all failed: %s", exc)
-            self._risk.state = BotState.PAUSED
+            self._risk.set_paused()
             await self._update_dashboard(self._current_market)
             return
 
         if cmd == "STOP":
             logger.info("Dashboard STOP command received")
+            self._selection_cancel.set()
             market = self._current_market
             if market:
                 try:
@@ -359,9 +369,29 @@ class RewardBot:
             self._current_market = None
             self._open_orders = []
             self._positions = []
-            self._risk.state = BotState.PAUSED
+            self._risk.set_paused()
+            logger.info("Bot stopped — waiting for START command")
             await self._update_dashboard(self._current_market)
             return
+
+    async def _sleep_with_command_checks(self, seconds: float, step: float = 0.2) -> None:
+        """
+        Sleep in small increments so dashboard commands remain responsive
+        even while the bot is in RUNNING / COOLDOWN / UNHEDGED / PAUSED waits.
+        """
+        end_at = time.monotonic() + max(0.0, float(seconds))
+
+        while self._running:
+            remaining = end_at - time.monotonic()
+            if remaining <= 0:
+                return
+
+            await self._handle_dashboard_command()
+
+            if not self._running:
+                return
+
+            await asyncio.sleep(min(step, remaining))
 
     # ------------------------------------------------------------------
     # Market selection
@@ -372,7 +402,9 @@ class RewardBot:
         Run market selection without blocking the event loop, so dashboard
         commands like PAUSE/STOP can still be processed while selector is busy.
         """
-        loop = asyncio.get_event_loop()
+        self._selection_cancel.clear()
+
+        loop = asyncio.get_running_loop()
         future = loop.run_in_executor(None, self._select_market_blocking)
 
         while True:
@@ -383,11 +415,15 @@ class RewardBot:
                     logger.error("Market selection failed: %s", exc, exc_info=True)
                     return None
 
-            # Process commands while selection is still running
             await self._handle_dashboard_command()
 
             if self._risk.state != BotState.SELECTING:
+                self._selection_cancel.set()
                 logger.info("Selection interrupted by state change → %s", self._risk.state)
+                return None
+
+            if self._selection_cancel.is_set():
+                logger.info("Selection interrupted by cancellation request")
                 return None
 
             await asyncio.sleep(0.2)
@@ -395,7 +431,10 @@ class RewardBot:
     def _select_market_blocking(self) -> Optional[MarketInfo]:
         if self.cfg.market_selection_mode == "MANUAL":
             return self._load_manual_market()
-        return self._selector.select_best_market(force=self._selector.should_reselect())
+        return self._selector.select_best_market(
+            force=self._selector.should_reselect(),
+            cancel_event=self._selection_cancel,
+        )
 
     def _load_manual_market(self) -> Optional[MarketInfo]:
         dashboard_ref = get_manual_market_ref()
@@ -640,7 +679,7 @@ class RewardBot:
         if not force and (now - self._available_usdc_last_refresh) < 30:
             return
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             bal = await loop.run_in_executor(None, self._client.get_available_usdc)
             self._available_usdc = bal
@@ -654,7 +693,7 @@ class RewardBot:
     # ------------------------------------------------------------------
 
     async def _poll_rest(self, market) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             raw_orders = await loop.run_in_executor(None, self._client.get_open_orders)
             self._open_orders = _parse_open_orders(raw_orders, market)
@@ -867,6 +906,7 @@ class RewardBot:
 
     def stop(self):
         logger.info("RewardBot shutdown requested")
+        self._selection_cancel.set()
         self._running = False
         for t in self._ws_tasks:
             t.cancel()

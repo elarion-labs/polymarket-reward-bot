@@ -68,7 +68,14 @@ class MarketSelector:
                 return None
         return None
 
-    def select_best_market(self, force: bool = False) -> Optional[MarketInfo]:
+    def _cancelled(self, cancel_event: Any) -> bool:
+        return bool(cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set())
+
+    def select_best_market(self, force: bool = False, cancel_event: Any = None) -> Optional[MarketInfo]:
+        if self._cancelled(cancel_event):
+            logger.info("MarketSelector: selection cancelled before start")
+            return self._selected
+
         if not force and not self.should_reselect():
             return self._selected
 
@@ -83,6 +90,10 @@ class MarketSelector:
         seen_cursors: set[str] = set()
 
         for page in range(1, REWARDS_MAX_PAGES + 1):
+            if self._cancelled(cancel_event):
+                logger.info("MarketSelector: selection cancelled during pagination")
+                return self._selected
+
             if not next_cursor or next_cursor in seen_cursors:
                 break
             seen_cursors.add(next_cursor)
@@ -103,11 +114,15 @@ class MarketSelector:
             )
 
             for raw in raw_markets:
+                if self._cancelled(cancel_event):
+                    logger.info("MarketSelector: selection cancelled while scoring markets")
+                    return self._selected
+
                 try:
                     info = self._parse_market(raw)
                     if info is None:
                         continue
-                    info = self._score_market(info)
+                    info = self._score_market(info, cancel_event=cancel_event)
                     candidates.append(info)
                 except Exception as exc:
                     logger.warning(
@@ -123,6 +138,10 @@ class MarketSelector:
             # Only stop early if we already found a VERY good candidate
             if len(candidates) >= 10 and candidates[0].reward_per_capital > 0.05:
                 break
+
+        if self._cancelled(cancel_event):
+            logger.info("MarketSelector: selection cancelled before final ranking")
+            return self._selected
 
         if not candidates:
             logger.warning("MarketSelector: no eligible markets found")
@@ -307,7 +326,7 @@ class MarketSelector:
 
         return info
 
-    def _score_market(self, info: MarketInfo) -> MarketInfo:
+    def _score_market(self, info: MarketInfo, cancel_event: Any = None) -> MarketInfo:
         def _levels_from_book(book_obj: object, side: str) -> list[tuple[float, float]]:
             raw_levels = []
             if isinstance(book_obj, dict):
@@ -339,12 +358,18 @@ class MarketSelector:
                     continue
             return out
 
+        if self._cancelled(cancel_event):
+            raise RuntimeError("selection cancelled")
+
         try:
             book_raw = self._client.get_orderbook(info.yes_token_id)
         except PolyClientError as exc:
             raise RuntimeError(
                 f"Cannot fetch book for {info.yes_token_id}: {exc}"
             ) from exc
+
+        if self._cancelled(cancel_event):
+            raise RuntimeError("selection cancelled")
 
         bids_t = _levels_from_book(book_raw, "bids")
         asks_t = _levels_from_book(book_raw, "asks")
@@ -391,6 +416,9 @@ class MarketSelector:
 
         book_no = None
         if info.no_token_id:
+            if self._cancelled(cancel_event):
+                raise RuntimeError("selection cancelled")
+
             try:
                 book_no_raw = self._client.get_orderbook(info.no_token_id)
                 bids_no_t = _levels_from_book(book_no_raw, "bids")
@@ -401,6 +429,9 @@ class MarketSelector:
                 }
             except Exception:
                 pass
+
+        if self._cancelled(cancel_event):
+            raise RuntimeError("selection cancelled")
 
         estimator = RewardEstimator(rp)
         est = estimator.estimate(
